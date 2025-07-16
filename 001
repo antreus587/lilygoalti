@@ -1,0 +1,1030 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <MS5611.h>
+#include <Preferences.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <vector>     // Pre RobustMovingAverageFilter
+#include <algorithm>  // Pre RobustMovingAverageFilter (pre std::sort)
+// #include <driver/ledc.h> // Pre pípák - ZAKOMENTOVANÉ PRE RIEŠENIE PROBLÉMOV, PREŠLI SME NA BIT-BANGING
+
+// =====================================================================================================================
+// 0.0. Verzia Firmvéru
+// =====================================================================================================================
+const char* FIRMWARE_VERSION = "0.0.9.1"; // Aktuálna verzia firmvéru (Opravené manuálne ARM/DISARM správanie)
+
+// =====================================================================================================================
+// 1.0. Definície Pinov
+// =====================================================================================================================
+#define BUZZER_PIN 7 // GPIO pin pre pípák
+
+// LEDC definície sú teraz irelevantné, pretože prechádzame na bit-banging.
+// #define LEDC_TIMER_BIT     LEDC_TIMER_8_BIT // Rozlíšenie 8 bitov (0-255)
+// #define LEDC_BASE_FREQ     3000             // Základná frekvencia PWM (3kHz)
+// #define LEDC_CHANNEL_0     LEDC_CHANNEL_0   // Použijeme kanál 0
+// #define LEDC_TIMER_0       LEDC_TIMER_0     // Použijeme časovač 0
+
+// =====================================================================================================================
+// 2.0. BLE UUIDs
+// =====================================================================================================================
+#define SERVICE_UUID                  "4fafc201-1fb5-459e-8fcc-c5c9c33191b4"
+#define DATA_CHARACTERISTIC_UUID      "beb5483e-36e1-4688-b7f5-ea07361b26a8" // Pre výšku a teplotu (hlavné dáta)
+#define COMMAND_CHARACTERISTIC_UUID   "1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d" // Pre príkazy (napr. reset AGL)
+
+// Nové UUID pre rozdelené nastavenia
+#define FREEFALL_ALTS_CHARACTERISTIC_UUID "a1a2a3a4-1111-2222-3333-444455556666" // Pre 4 voľnopádové výšky
+#define CANOPY_ALTS_CHARACTERISTIC_UUID   "b1b2b3b4-1111-2222-3333-444455556666" // Pre 3 výšky padáka
+#define OTHER_SETTINGS_CHARACTERISTIC_UUID "c1c2c3c4-1111-2222-3333-444455556666" // Pre aktívny filter, logovanie a ARMING výšku
+
+// =====================================================================================================================
+// 3.0. Globálne premenné a objekty
+// =====================================================================================================================
+MS5611 altimeter; // Názov objektu senzora ako v tvojom funkčnom kóde 0.0.4
+Preferences preferences; // NVS (Non-Volatile Storage) pre ukladanie nastavení
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pDataCharacteristic = NULL;
+BLECharacteristic* pCommandCharacteristic = NULL; // Nová charakteristika pre príkazy
+
+// Nové premenné pre charakteristiky nastavení
+BLECharacteristic* pFreefallAltsCharacteristic = NULL;
+BLECharacteristic* pCanopyAltsCharacteristic = NULL;
+BLECharacteristic* pOtherSettingsCharacteristic = NULL;
+
+bool deviceConnected = false; // Indikuje, či je BLE klient pripojený
+bool aglCalibrated = false; // Flag, či bola AGL kalibrácia vykonaná
+bool resetAglCommand = false; // Flag pre reset AGL cez BLE príkaz
+bool altimeterArmed = false; // NOVÉ: Flag, či je výškomer "ozbrojený" a môže pípať alarmy
+bool armAltimeterCommand = false; // NOVÉ: Flag pre ARM altimetra cez BLE príkaz
+bool disarmAltimeterCommand = false; // NOVÉ: Flag pre DISARM altimetra cez BLE príkaz
+bool manualArmOverride = false; // NOVÉ: Flag pre indikáciu, či bol altimeter manuálne ozbrojený cez BLE
+
+// FreeRTOS Mutex pre ochranu zdieľaných nastavení (vzájomné vylúčenie)
+SemaphoreHandle_t configMutex; // FreeRTOS Popisy úloh (Task Handles)
+TaskHandle_t AltimeterTaskHandle = NULL; // Názov ako v tvojom funkčnom kóde 0.0.4
+TaskHandle_t BatteryMonitorTaskHandle = NULL; // Názov ako v tvojom funkčnom kóde 0.0.4
+
+// Pridajte globálnu premennú
+QueueHandle_t settingsQueue = NULL;
+
+// =====================================================================================================================
+// 4.0. Štruktúra nastavení aplikácie (s výberom filtra)
+// =====================================================================================================================
+typedef enum {
+    FILTER_NONE = 0,
+    FILTER_KALMAN,
+    FILTER_ROBUST_MOVING_AVERAGE,
+    FILTER_EXPONENTIAL_MOVING_AVERAGE
+} FilterType;
+typedef struct {
+    float freefallAltitudes[4]; // 4 užívateľsky nastaviteľné výšky pre voľný pád
+    float canopyAltitudes[3]; // 3 užívateľsky nastaviteľné výšky pre let na padáku
+    FilterType activeFilter; // Nové: výber aktívneho filtra
+    bool enableDataLogging;     // Zapnúť/vypnúť záznam dát
+    float armingAltitude;     // NOVÉ: Výška pre "ozbrojenie" výškomera
+} AppSettings;
+
+AppSettings currentSettings; // Globálna inštancia aktuálnych nastavení
+
+// =====================================================================================================================
+// 5.0. Triedy Filtrov
+// =====================================================================================================================
+class KalmanFilter {
+private:
+    double Q; // Kovariancia šumu procesu
+    double R; // Kovariancia šumu merania
+    double X; // Odhadovaná hodnota
+    double P; // Kovariancia chyby odhadu
+    double K; // Kalmanov zisk
+
+public:
+    KalmanFilter(double processNoise, double measurementNoise, double initialEstimate, double initialErrorCovariance) {
+        Q = processNoise;
+        R = measurementNoise;
+        X = initialEstimate;
+        P = initialErrorCovariance;
+    }
+
+    double update(double measurement) {
+        // Predikčná aktualizácia
+        P = P + Q;
+        // Aktualizácia merania
+        K = P / (P + R);
+        X = X + K * (measurement - X);
+        P = (1 - K) * P;
+
+        return X;
+    }
+};
+// --- Nová trieda: Robustný kĺzavý priemer ---
+class RobustMovingAverageFilter {
+private:
+    std::vector<double> window;
+    size_t windowSize;
+    float trimPercentage; // Percento hodôt na odstránenie z oboch koncov
+
+public:
+    RobustMovingAverageFilter(size_t size, float trim = 0.1) : windowSize(size), trimPercentage(trim) {
+        window.reserve(windowSize); // Rezervuj pamäť
+    }
+
+    double update(double measurement) {
+        window.push_back(measurement);
+        if (window.size() > windowSize) {
+            window.erase(window.begin()); // Odstráň najstaršiu hodnotu
+        }
+
+        if (window.empty()) {
+            return 0.0;
+        }
+
+        // Skopírujte a zotrieďte pre robustný priemer
+        std::vector<double> sortedWindow = window;
+        std::sort(sortedWindow.begin(), sortedWindow.end());
+
+        size_t valuesToTrim = static_cast<size_t>(sortedWindow.size() * trimPercentage);
+
+        double sum = 0;
+        size_t count = 0; // Priemer len z 'netrimovaných' hodôt
+        size_t startIndex = valuesToTrim;
+        size_t endIndex = sortedWindow.size() - valuesToTrim;
+
+        if (startIndex >= endIndex) { // Ak po trimovaní nezostali žiadne platné hodnoty
+            // Vraciame priemer všetkých hodôt, ak ich je málo
+            for (double val : sortedWindow) {
+                sum += val;
+            }
+            return (sortedWindow.size() > 0) ? sum / sortedWindow.size() : 0.0;
+        }
+
+        for (size_t i = startIndex; i < endIndex; ++i) {
+            sum += sortedWindow[i];
+            count++;
+        }
+
+        return (count > 0) ? sum / count : 0.0;
+    }
+};
+
+// --- Nová trieda: Exponenciálny kĺzavý priemer ---
+class ExponentialMovingAverageFilter {
+private:
+    double alpha; // Koeficient vyhladzovania (0.0 < alpha < 1.0)
+    double smoothedValue;
+    bool initialized;
+public:
+    ExponentialMovingAverageFilter(double smoothingFactor, double initialValue = 0.0) :
+        alpha(smoothingFactor), smoothedValue(initialValue), initialized(false) {
+        // Zabezpečenie, aby alpha bola v rozsahu (0, 1)
+        if (alpha <= 0.0) alpha = 0.01;
+        if (alpha >= 1.0) alpha = 0.99;
+    }
+
+    double update(double measurement) {
+        if (!initialized) {
+            smoothedValue = measurement;
+            initialized = true;
+        } else {
+            smoothedValue = alpha * measurement + (1.0 - alpha) * smoothedValue;
+        }
+        return smoothedValue;
+    }
+};
+// --- Inštancie všetkých filtrov ---
+KalmanFilter altitudeKalmanFilter(0.01, 0.5, 0, 1);
+RobustMovingAverageFilter altitudeRobustMAFilter(10, 0.1); // Okno 10 meraní, trim 10% z každého konca
+ExponentialMovingAverageFilter altitudeEMAFilter(0.2);     // Alfa 0.2 (stredné vyhladzovanie)
+
+// =====================================================================================================================
+// 6.0. Funkcie NVS (Non-Volatile Storage)
+// =====================================================================================================================
+void saveSettings() {
+
+AppSettings settingsToSave;
+    memcpy(&settingsToSave, &currentSettings, sizeof(AppSettings));
+    
+    if (xQueueSend(settingsQueue, &settingsToSave, 0) != pdTRUE) {
+        Serial.println("CHYBA: Fronta nastavení je plná!");
+    }
+
+  // 1. Uloženie nastavení do NVS
+  preferences.begin("altimeter-cfg", false);
+  preferences.putBytes("settings", &currentSettings, sizeof(currentSettings));
+  preferences.end();
+
+  // 2. Jednotný debug výpis pre všetky nastavenia
+  char settingsBuffer[300];
+  snprintf(settingsBuffer, sizeof(settingsBuffer),
+    "Nastavenia uložené do NVS:\n"
+    "FREEFALL: %.2f, %.2f, %.2f, %.2f m\n"
+    "CANOPY: %.2f, %.2f, %.2f m\n"
+    "OTHER: Filter=%d, Logging=%s, Arming=%.2f m",
+    currentSettings.freefallAltitudes[0],
+    currentSettings.freefallAltitudes[1],
+    currentSettings.freefallAltitudes[2],
+    currentSettings.freefallAltitudes[3],
+    currentSettings.canopyAltitudes[0],
+    currentSettings.canopyAltitudes[1],
+    currentSettings.canopyAltitudes[2],
+    currentSettings.activeFilter,
+    currentSettings.enableDataLogging ? "ON" : "OFF",
+    currentSettings.armingAltitude);
+  Serial.println(settingsBuffer);
+
+  // 3. BLE notifikácie
+  if (deviceConnected) {
+    if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+      // Freefall
+      uint8_t payloadFF[4 * sizeof(float)];
+      memcpy(payloadFF, currentSettings.freefallAltitudes, sizeof(payloadFF));
+      logHexData("FREEFALL", payloadFF, sizeof(payloadFF));
+      if (pFreefallAltsCharacteristic != NULL) {
+        pFreefallAltsCharacteristic->setValue(payloadFF, sizeof(payloadFF));
+        pFreefallAltsCharacteristic->notify();
+      }
+
+      // Canopy
+      uint8_t payloadCanopy[3 * sizeof(float)];
+      memcpy(payloadCanopy, currentSettings.canopyAltitudes, sizeof(payloadCanopy));
+      logHexData("CANOPY", payloadCanopy, sizeof(payloadCanopy));
+      if (pCanopyAltsCharacteristic != NULL) {
+        pCanopyAltsCharacteristic->setValue(payloadCanopy, sizeof(payloadCanopy));
+        pCanopyAltsCharacteristic->notify();
+      }
+
+      // Other settings
+      uint8_t payloadOther[3 * sizeof(float)];
+      float tempSettings[3] = {
+        static_cast<float>(currentSettings.activeFilter),
+        static_cast<float>(currentSettings.enableDataLogging),
+        currentSettings.armingAltitude
+      };
+      memcpy(payloadOther, tempSettings, sizeof(payloadOther));
+      logHexData("OTHER", payloadOther, sizeof(payloadOther));
+      if (pOtherSettingsCharacteristic != NULL) {
+        pOtherSettingsCharacteristic->setValue(payloadOther, sizeof(payloadOther));
+        pOtherSettingsCharacteristic->notify();
+      }
+
+      Serial.flush(); // Jediný flush na konci
+      xSemaphoreGive(configMutex);
+    }
+  }
+}
+
+// Pomocná funkcia pre hex výpis
+void logHexData(const char* label, const uint8_t* data, size_t length) {
+  char hexBuffer[100];
+  char* ptr = hexBuffer;
+  for (size_t i = 0; i < length; ++i) {
+    if (i % 4 == 0) ptr += sprintf(ptr, " ");  // Oddeľovač každé 4 bajty
+    ptr += sprintf(ptr, "%02X ", data[i]);
+  }
+  Serial.printf("BLE %s RAW: %s\n", label, hexBuffer);
+}
+
+void loadSettings() {
+  // ***********************************************************************************************************************
+  // *** DOČASNÉ: Vymaž NVS pre účely testovania. Po jednom úspešnom spustení odstráň tento riadok. odkomentuj ak chces ***
+  // preferences.begin("altimeter-cfg", false); // Otvorenie NVS pre našu aplikáciu
+  // preferences.clear(); // Toto vykoná vymazanie všetkých preferencií pod "altimeter-cfg"
+  // preferences.end(); // Uzavretie NVS po vymazaní
+  Serial.println("NVS vymazané pre testovacie účely!"); // Pridaj túto správu pre potvrdenie
+  // ***********************************************************************************************************************
+
+  preferences.begin("altimeter-cfg", false); // Znova otvor NVS na čítanie
+  size_t bytesRead = preferences.getBytes("settings", &currentSettings, sizeof(currentSettings)); // Pokúsi sa načítať nastavenia
+  preferences.end(); // Uzavretie NVS
+
+  if (bytesRead != sizeof(currentSettings) || bytesRead == 0) { // Ak sa nenašli žiadne dáta ALEBO ak došlo k nezhode veľkosti
+    Serial.printf("Nastavenia v NVS majú nesprávnu veľkosť (%d bajtov), očakávaná %d bajtov. Nastavujem predvolené hodnoty.\n", bytesRead, sizeof(currentSettings));
+    Serial.println("Nastavenia nenájdené v NVS alebo sú nekompatibilné, nastavujem predvolené hodnoty.");
+    currentSettings = {
+        {1500.0, 1300.0, 1000.0, 900.0}, // Aktualizované predvolené hodnoty pre voľný pád
+        {330.0, 230.0, 130.0},           // Aktualizované predvolené hodnoty pre let na padáku
+        FILTER_KALMAN, // Predvolený filter
+        true,          // enableDataLogging
+        300.0          // Predvolená armingAltitude (podľa Vášho vstupu)
+    };
+    saveSettings(); // Ulož predvolené nastavenia do NVS
+  }
+  Serial.println("Nastavenia načítané.");
+  Serial.printf("Aktívny filter po načítaní: %d\n", currentSettings.activeFilter);
+  Serial.printf("Arming Altitude po načítaní: %.2f m\n", currentSettings.armingAltitude);
+}
+
+// =====================================================================================================================
+// 7.0. BLE Spätné volania (Callbacks)
+// =====================================================================================================================
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        deviceConnected = true;
+        Serial.println("Klient pripojený. Obnovujem Battery Monitor Task.");
+        if (BatteryMonitorTaskHandle != NULL) {
+            vTaskResume(BatteryMonitorTaskHandle);
+        }
+        // Odošli aktuálne nastavenia hneď po pripojení
+        saveSettings();
+    }
+
+    void onDisconnect(BLEServer* pServer) {
+        deviceConnected = false;
+        Serial.println("Klient odpojený. Pozastavujem Battery Monitor Task.");
+        if (BatteryMonitorTaskHandle != NULL) {
+            vTaskSuspend(BatteryMonitorTaskHandle);
+        }
+        // Znova spusti inzerovanie, aby sa mohli pripojiť ďalší klienti
+        BLEAdvertising *pAdvertising = pServer->getAdvertising();
+        pAdvertising->start();
+    }
+};
+
+class FreefallAltsCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        // 1. Kontrola dĺžky dát
+        if (pCharacteristic->getValue().length() != 4 * sizeof(float)) {
+            Serial.printf("[CHYBA] Freefall: Zlá dĺžka dát (%d bajtov)\n", pCharacteristic->getValue().length());
+            return;
+        }
+
+        // 2. Alokácia pamäte
+        float* newAlts = new float[4];
+        memcpy(newAlts, pCharacteristic->getData(), 4 * sizeof(float));
+
+        // 3. Výpis prijatých hodnôt
+        Serial.printf("BLE Freefall: %.2f, %.2f, %.2f, %.2f m\n", 
+                     newAlts[0], newAlts[1], newAlts[2], newAlts[3]);
+
+        // 4. Asynchrónne spracovanie
+        xTaskCreate(
+            [](void* param) {
+                float* alts = (float*)param;
+                if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(100)) == pdTRUE) {  // <-- OPRAVA: Pridané == pdTRUE
+                    memcpy(currentSettings.freefallAltitudes, alts, 4 * sizeof(float));
+                    saveSettings();
+                    xSemaphoreGive(configMutex);
+                }
+                delete[] alts;  // Korektné uvoľnenie pamäte
+                vTaskDelete(NULL);
+            },
+            "AsyncSave",
+            4096,  // Stačí 4KB zásobníka
+            (void*)newAlts,
+            1,     // Nižšia priorita
+            NULL
+        );
+    }
+};
+
+class CanopyAltsCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        String arduinoStringValue = pCharacteristic->getValue();
+        const uint8_t* rawData = reinterpret_cast<const uint8_t*>(arduinoStringValue.c_str());
+
+        if (arduinoStringValue.length() == (3 * sizeof(float))) {
+            if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+                memcpy(currentSettings.canopyAltitudes, rawData, 3 * sizeof(float));
+                Serial.println("Nové canopyAltitudes prijaté cez BLE.");
+                saveSettings(); // Ulož a odošli notifikácie
+                xSemaphoreGive(configMutex);
+            } else {
+                Serial.println("Chyba: Nepodarilo sa získať mutex pre canopyAltitudes.");
+            }
+        } else {
+            Serial.printf("Prijaté dáta pre canopyAltitudes majú nesprávnu veľkosť: %d (očakávaná %d)\n", arduinoStringValue.length(), (3 * sizeof(float)));
+        }
+    }
+};
+
+class OtherSettingsCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+        String arduinoStringValue = pCharacteristic->getValue();
+        const uint8_t* rawData = reinterpret_cast<const uint8_t*>(arduinoStringValue.c_str());
+
+        if (arduinoStringValue.length() == (3 * sizeof(float))) { // Očakávame teraz 3 floaty!
+            if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+                float tempFilter, tempLogging, tempArmingAltitude; // NOVÉ: tempArmingAltitude
+                memcpy(&tempFilter, rawData, sizeof(float));
+                memcpy(&tempLogging, rawData + sizeof(float), sizeof(float));
+                memcpy(&tempArmingAltitude, rawData + 2 * sizeof(float), sizeof(float)); // NOVÉ
+
+                currentSettings.activeFilter = static_cast<FilterType>(static_cast<int>(tempFilter));
+                currentSettings.enableDataLogging = (static_cast<int>(tempLogging) == 1);
+                currentSettings.armingAltitude = tempArmingAltitude; // NOVÉ
+
+                Serial.printf("Nové OtherSettings prijaté cez BLE. Filter: %d, Logovanie: %d, Arming Altitude: %.2f\n",
+                              currentSettings.activeFilter, currentSettings.enableDataLogging, currentSettings.armingAltitude);
+                saveSettings(); // Ulož a odošli notifikácie
+                xSemaphoreGive(configMutex);
+            } else {
+                Serial.println("Chyba: Nepodarilo sa získať mutex pre OtherSettings.");
+            }
+        } else {
+            Serial.printf("Prijaté dáta pre OtherSettings majú nesprávnu veľkosť: %d (očakávaná %d)\n", arduinoStringValue.length(), (3 * sizeof(float)));
+        }
+    }
+};
+
+class MyCommandCharacteristicCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pCharacteristic) {
+    String arduinoStringValue = pCharacteristic->getValue();
+    std::string rxValue = arduinoStringValue.c_str(); // Explicitná konverzia
+
+    if (rxValue.length() > 0) {
+      Serial.print("Prijatý príkaz: ");
+      for (int i = 0; i < rxValue.length(); i++) {
+        Serial.print(rxValue[i]);
+      }
+      Serial.println();
+
+      if (rxValue == "RESET_AGL") {
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            resetAglCommand = true;
+            xSemaphoreGive(configMutex);
+        }
+        Serial.println("Prijatý príkaz na reset AGL.");
+      } else if (rxValue == "ARM_ALTIMETER") { // NOVÝ PRÍKAZ
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            armAltimeterCommand = true;
+            xSemaphoreGive(configMutex);
+        }
+        Serial.println("Prijatý príkaz na ARM altimetra.");
+      } else if (rxValue == "DISARM_ALTIMETER") { // NOVÝ PRÍKAZ
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            disarmAltimeterCommand = true;
+            xSemaphoreGive(configMutex);
+        }
+        Serial.println("Prijatý príkaz na DISARM altimetra.");
+      }
+    }
+  }
+};
+
+// =====================================================================================================================
+// 8.0. FreeRTOS Úlohy (Tasks)
+// =====================================================================================================================
+
+// Globálne konštanty pre výpočet PWM z hlasitosti z bzuciak.txt
+const int pwmPeriod = 333; // Mikrosekundy (cca 3 kHz)
+const int minOn = 5;       // Minimálny čas zapnutia v mikrosekundách (pre volumeLevel 1)
+const int maxOn = 300;     // Maximálny čas zapnutia v mikrosekundách (pre volumeLevel 8)
+
+// Funkcia na výpočet onTimePWM a offTimePWM z hlasitosti (prevzaté z bzuciak.txt, upravené)
+// Táto funkcia vypočíta onTimePWM a offTimePWM pre priame prepínanie pinu (bit-banging).
+void vypocitajPWM(int volumeLevel, int& onTimePWM, int& offTimePWM) {
+  // VolumeLevel je od 1 do 8.
+  // Logaritmická škála pre jemnejšiu kontrolu hlasitosti.
+  // Zabezpečíme, aby volumeLevel bolo v rozsahu 1 až 8
+  if (volumeLevel < 1) volumeLevel = 1;
+  if (volumeLevel > 8) volumeLevel = 8;
+
+  // 8 úrovní hlasitosti znamená 7 intervalov na logaritmickej škále.
+  double scale = (log(maxOn) - log(minOn)) / 7.0;
+  onTimePWM = (int)(exp(log(minOn) + scale * (volumeLevel - 1)));
+
+  // Zabezpečiť, aby onTimePWM neprekročilo pwmPeriod
+  if (onTimePWM > pwmPeriod) onTimePWM = pwmPeriod;
+
+  offTimePWM = pwmPeriod - onTimePWM;
+  if (offTimePWM < 0) offTimePWM = 0; // Pre prípad zaokrúhlenia alebo chýb
+}
+
+// Funkcia pre ovládanie pípáka s hlasitosťou (pomocou bit-banging)
+// frequency parameter je v tomto režime ignorovaný, pretože frekvencia je daná pwmPeriod
+void beep(int frequency, int duration_ms, int volumeLevel) {
+    if (BUZZER_PIN != -1) {
+        int onPWM_val, offPWM_val;
+        vypocitajPWM(volumeLevel, onPWM_val, offPWM_val); // Vypočítaj na základe volumeLevel
+
+        unsigned long startBeep = millis();
+        while (millis() - startBeep < duration_ms) {
+            digitalWrite(BUZZER_PIN, HIGH);
+            delayMicroseconds(onPWM_val);
+            digitalWrite(BUZZER_PIN, LOW);
+            delayMicroseconds(offPWM_val);
+        }
+        digitalWrite(BUZZER_PIN, LOW); // Uisti sa, že bzučiak je po ukončení vypnutý
+    }
+}
+
+// Funkcia na prehrávanie vzorov pípnutia (adaptované z pipajPodlaVzorov)
+// pattern: pole dĺžok pípnutí v ms
+// patternSize: počet prvkov vo pattern poli
+// beepFrequency: frekvencia tónu pre pípnutia (Hz) - teraz pre bit-banging to je pevne 3kHz
+// delayBetweenBeepsMs: pauza medzi jednotlivými pípnutiami vo vzore (ms)
+// repeats: koľkokrát sa má celý vzor zopakovať
+// repeatPauseMs: pauza medzi opakovaniami celého vzoru (ms)
+// volumeLevel: úroveň hlasitosti (1-8)
+void playPattern(const int pattern[], int patternSize, int beepFrequency, int delayBetweenBeepsMs, int repeats, int repeatPauseMs, int volumeLevel) {
+  for (int r = 0; r < repeats; ++r) {
+    for (int i = 0; i < patternSize; ++i) {
+      beep(beepFrequency, pattern[i], volumeLevel); // Parameter frequency bude ignorovaný v novej beep()
+      if (i < patternSize - 1) { // Nečakaj po poslednom pípnutí vo vzore
+        delay(delayBetweenBeepsMs);
+      }
+    }
+    if (r < repeats - 1) { // Nečakaj po poslednom opakovaní celého vzoru
+      delay(repeatPauseMs);
+    }
+  }
+}
+
+// Globálne premenné pre vzory a ich opakovania (prevzaté z bzuciak.txt)
+int repeats1800 = 2;
+int repeats1500 = 3;
+int repeats1200 = 3;
+int repeats900   = 3;
+int repeatPauseMs = 250;  // pauza medzi opakovaniami celého vzoru (ms)
+int delayBetweenBeepsMs = 100; // pauza medzi jednotlivými pípnutiami vo vzore (ms)
+int defaultBeepVolume = 5; // Predvolená hlasitosť pre pípnutia (môže byť zmenená)
+int beepFrequency = 3000; // Frekvencia pípnutia (Hz) - stále udržujeme pre konzistenciu, ale je pevne 3kHz v bit-banging režime
+
+// Flagy na zabezpečenie, aby sa pípnutia spustili len raz pri prechode prahom
+bool p_1800m_triggered = false;
+bool p_1500m_triggered = false;
+bool p_1200m_triggered = false;
+bool p_900m_triggered = false;
+
+// NOVÉ FLAGY PRE PÍPNUTIA PRI LETE NA PADÁKU
+bool p_300m_triggered = false;
+bool p_200m_triggered = false;
+bool p_100m_triggered = false;
+
+
+// Úloha pre čítanie výškomera, výpočty a pípák
+void altimeterTask(void *pvParameters) {
+    Serial.println("Altimeter Task: Spustená na Core1.");
+    Wire.begin(15, 16); // Inicializácia I2C pre MS5611 (SDA=GPIO15, SCL=GPIO16)
+
+    if (altimeter.begin()) {
+        Serial.println("MS5611 senzor inicializovaný úspešne!");
+    } else {
+        Serial.println("Chyba: MS5611 senzor sa nepodarilo inicializovať! Zastavujem.");
+        while (1);
+    }
+
+    altimeter.setOversampling(OSR_ULTRA_HIGH);
+
+    float referencePressure_hPa = 0.0;
+    unsigned long startTime = millis();
+    int readingsCount = 0;
+    float pressureSum = 0.0;
+
+    Serial.println("Altimeter Task: Kalibrujem AGL po dobu 5 sekúnd...");
+    while (millis() - startTime < 5000) {
+        altimeter.read();
+        pressureSum += altimeter.getPressure();
+        readingsCount++;
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    if (readingsCount > 0) {
+        referencePressure_hPa = pressureSum / readingsCount;
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            aglCalibrated = true;
+            xSemaphoreGive(configMutex);
+        }
+        Serial.printf("Altimeter Task: AGL kalibrovaný. Referenčný tlak: %.2f hPa\n", referencePressure_hPa);
+    } else {
+        Serial.println("Altimeter Task: Kalibrácia AGL zlyhala: Žiadne údaje zo senzora. Používa sa predvolený referenčný tlak.");
+        referencePressure_hPa = 1013.25;
+    }
+
+    // Premenné pre výpočet vertikálnej rýchlosti
+    static float previousAltitude = 0.0; // Predchádzajúca filtrovaná výška
+    static unsigned long previousMillis = 0; // Predchádzajúci čas merania
+    float verticalVelocity = 0.0; // Vertikálna rýchlosť v m/s
+
+    // Inicializácia pre prvý výpočet
+    altimeter.read(); // Prvé prečítanie pre inicializáciu
+    float initialPressure = altimeter.getPressure();
+    previousAltitude = 44330.0 * (1.0 - pow(initialPressure / referencePressure_hPa, 1.0 / 5.255));
+    previousMillis = millis();
+
+
+    for (;;) {
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            if (resetAglCommand) {
+                resetAglCommand = false;
+                xSemaphoreGive(configMutex);
+
+                Serial.println("Altimeter Task: Prebieha reset AGL pomocou príkazu...");
+                pressureSum = 0;
+                readingsCount = 0;
+                startTime = millis();
+                while (millis() - startTime < 5000) {
+                    altimeter.read();
+                    pressureSum += altimeter.getPressure();
+                    readingsCount++;
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                }
+
+                if (readingsCount > 0) {
+                    referencePressure_hPa = pressureSum / readingsCount;
+                    Serial.printf("Altimeter Task: AGL znova kalibrovaný. Nový referenčný tlak: %.2f hPa\n", referencePressure_hPa);
+                } else {
+                    Serial.println("Altimeter Task: Znova kalibrácia AGL zlyhala: Žiadne údaje zo senzora. Ponecháva sa predchádzajúci referenčný tlak.");
+                }
+                
+                // Po re-kalibrácii resetujeme aj hodnoty pre výpočet vertikálnej rýchlosti
+                altimeter.read(); 
+                initialPressure = altimeter.getPressure();
+                previousAltitude = 44330.0 * (1.0 - pow(initialPressure / referencePressure_hPa, 1.0 / 5.255));
+                previousMillis = millis();
+
+                // Resetujem flagy pre pípnutia po kalibrácii (aj voľný pád, aj padák)
+                p_1800m_triggered = false;
+                p_1500m_triggered = false;
+                p_1200m_triggered = false;
+                p_900m_triggered = false;
+                p_300m_triggered = false;
+                p_200m_triggered = false;
+                p_100m_triggered = false;
+                altimeterArmed = false; // Po re-kalibrácii sa výškomer odozbrojí
+                manualArmOverride = false; // NOVÉ: Reset manualArmOverride po re-kalibrácii
+
+                continue;
+            } else if (armAltimeterCommand) { // NOVÁ LOGIKA PRE ARM
+                armAltimeterCommand = false;
+                altimeterArmed = true;
+                manualArmOverride = true; // NOVÉ: Nastaví manualArmOverride na true
+                Serial.println("Altimeter manually ARMED via BLE command.");
+                beep(4000, 100, 8); // Krátke, vysoké pípnutie pre manuálne "ozbrojenie"
+                xSemaphoreGive(configMutex);
+                continue;
+            } else if (disarmAltimeterCommand) { // NOVÁ LOGIKA PRE DISARM
+                disarmAltimeterCommand = false;
+                altimeterArmed = false;
+                manualArmOverride = false; // NOVÉ: Nastaví manualArmOverride na false
+                Serial.println("Altimeter manually DISARMED via BLE command.");
+                beep(2000, 100, 8); // Krátke, nižšie pípnutie pre manuálne "odozbrojenie"
+                // Resetujem všetky flagy pípnutí po manuálnom odozbrojení
+                p_1800m_triggered = false;
+                p_1500m_triggered = false;
+                p_1200m_triggered = false;
+                p_900m_triggered = false;
+                p_300m_triggered = false;
+                p_200m_triggered = false;
+                p_100m_triggered = false;
+                xSemaphoreGive(configMutex);
+                continue;
+            }
+            xSemaphoreGive(configMutex);
+        }
+
+        altimeter.read();
+        float currentPressure_hPa = altimeter.getPressure();
+        float currentTemperature_C = altimeter.getTemperature();
+        float currentAltitude_m = 44330.0 * (1.0 - pow(currentPressure_hPa / referencePressure_hPa, 1.0 / 5.255));
+        double filteredAltitudeDouble = currentAltitude_m; // Používame double pre interný filter, ale odošleme ako float
+
+        if (xSemaphoreTake(configMutex, portMAX_DELAY) == pdTRUE) {
+            // Aplikácia zvoleného filtra
+            switch (currentSettings.activeFilter) {
+                case FILTER_KALMAN:
+                    filteredAltitudeDouble = altitudeKalmanFilter.update(currentAltitude_m);
+                    break;
+                case FILTER_ROBUST_MOVING_AVERAGE:
+                    filteredAltitudeDouble = altitudeRobustMAFilter.update(currentAltitude_m);
+                    break;
+                case FILTER_EXPONENTIAL_MOVING_AVERAGE:
+                    filteredAltitudeDouble = altitudeEMAFilter.update(currentAltitude_m);
+                    break;
+                case FILTER_NONE:
+                default:
+                    filteredAltitudeDouble = currentAltitude_m;
+                    break;
+            }
+            xSemaphoreGive(configMutex);
+        }
+        // Konvertujeme double z filtra späť na float pre odoslanie (zaokrúhlenie)
+        float filteredAltitude = static_cast<float>(filteredAltitudeDouble);
+        //Serial.printf("DEBUG: Filtrovaná Výška pred odoslaním BLE: %.2f m\n", filteredAltitude);
+
+        // Výpočet vertikálnej rýchlosti
+        unsigned long currentMillis = millis();
+        if (currentMillis > previousMillis) { // Zabráni deleniu nulou a chybám pri pretečení millis()
+            float timeDiffSeconds = (currentMillis - previousMillis) / 1000.0;
+            if (timeDiffSeconds > 0) { // Zabezpečí, že nedelíme nulou ani po prevode
+              verticalVelocity = (filteredAltitude - previousAltitude) / timeDiffSeconds;
+            } else {
+              verticalVelocity = 0.0; // Ak je časový rozdiel 0, rýchlosť je 0
+            }
+        } else {
+            verticalVelocity = 0.0; // Ak currentMillis nie je väčší, rýchlosť je 0
+        }
+
+        // Aktualizácia pre ďalšiu iteráciu
+        previousAltitude = filteredAltitude;
+        previousMillis = currentMillis;
+
+        // ===============================================
+        // NOVÉ: Logika "Ozbrojený" / "Neozbrojený" stav (automatická)
+        // ===============================================
+        // Ozbrojenie: ak nie je ozbrojený a výška prekročí armingAltitude
+        if (!altimeterArmed && filteredAltitude > currentSettings.armingAltitude) {
+            altimeterArmed = true;
+            manualArmOverride = false; // Ak sa ozbrojí automaticky, zrušíme manuálny override
+            Serial.printf("Altimeter Armed! (Dosiahnutá výška %.2f m, Arming výška %.2f m)\n", filteredAltitude, currentSettings.armingAltitude);
+            beep(4000, 200, 8); // Krátke, vysoké pípnutie pre "ozbrojenie"
+        }
+        // Odozbrojenie: Ak je ozbrojený, je nízko nad zemou a je stabilný (nízka vertikálna rýchlosť)
+        // NOVÁ PODMIENKA: Len ak NIE JE aktívny manualArmOverride
+        else if (altimeterArmed && !manualArmOverride && filteredAltitude < 10.0 && abs(verticalVelocity) < 1.0) { // abs(verticalVelocity) < 1.0 m/s
+            altimeterArmed = false;
+            manualArmOverride = false; // Zabezpečíme, že manualArmOverride je false
+            Serial.println("Altimeter Disarmed! (Pristátie alebo veľmi nízka výška).");
+            beep(2000, 200, 8); // Krátke, nižšie pípnutie pre "odozbrojenie"
+            
+            // Resetujem všetky flagy pípnutí po odozbrojení
+            p_1800m_triggered = false;
+            p_1500m_triggered = false;
+            p_1200m_triggered = false;
+            p_900m_triggered = false;
+            p_300m_triggered = false;
+            p_200m_triggered = false;
+            p_100m_triggered = false;
+        }
+
+
+        // Logika pípáka na základe výšky (len ak je výškomer ozbrojený)
+        if (altimeterArmed) { // Všetky alarmy sú podmienené stavom "ozbrojený"
+            int currentVolume = defaultBeepVolume; // Môže byť dynamicky menené, napr. podľa rýchlosti
+
+            // ===============================================
+            // Pípnutia pre voľný pád
+            // ===============================================
+
+            // 1800m - Rozchod
+            if (filteredAltitude <= currentSettings.freefallAltitudes[0] && !p_1800m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Rozchod.\n", currentSettings.freefallAltitudes[0]);
+                int pattern[] = {200, 200}; // dlhé, dlhé
+                playPattern(pattern, 2, beepFrequency, delayBetweenBeepsMs, repeats1800, repeatPauseMs, currentVolume);
+                p_1800m_triggered = true;
+            } else if (filteredAltitude > currentSettings.freefallAltitudes[0] + 50 && p_1800m_triggered) {
+                p_1800m_triggered = false;
+            }
+
+            // 1500m - Otvor padák
+            if (filteredAltitude <= currentSettings.freefallAltitudes[1] && !p_1500m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Otvor padák.\n", currentSettings.freefallAltitudes[1]);
+                int pattern[] = {200, 100, 200}; // dlhá, krátka, dlhá
+                playPattern(pattern, 3, beepFrequency, delayBetweenBeepsMs, repeats1500, repeatPauseMs, currentVolume);
+                p_1500m_triggered = true;
+            } else if (filteredAltitude > currentSettings.freefallAltitudes[1] + 50 && p_1500m_triggered) {
+                p_1500m_triggered = false;
+            }
+
+            // 1200m - Hlavný problém
+            if (filteredAltitude <= currentSettings.freefallAltitudes[2] && !p_1200m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Hlavný problém.\n", currentSettings.freefallAltitudes[2]);
+                int pattern[] = {50, 50, 50, 50}; // 4 krátke
+                playPattern(pattern, 4, beepFrequency, delayBetweenBeepsMs, repeats1200, repeatPauseMs, currentVolume);
+                p_1200m_triggered = true;
+            } else if (filteredAltitude > currentSettings.freefallAltitudes[2] + 50 && p_1200m_triggered) {
+                p_1200m_triggered = false;
+            }
+
+            // 900m - Záložný padák
+            if (filteredAltitude <= currentSettings.freefallAltitudes[3] && !p_900m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Záložný padák.\n", currentSettings.freefallAltitudes[3]);
+                int pattern[] = {50, 50, 50, 50, 50, 50}; // 6 krátkych
+                playPattern(pattern, 6, beepFrequency, delayBetweenBeepsMs, repeats900, repeatPauseMs, currentVolume);
+                p_900m_triggered = true;
+            } else if (filteredAltitude > currentSettings.freefallAltitudes[3] + 50 && p_900m_triggered) {
+                p_900m_triggered = false;
+            }
+
+            // ===============================================
+            // Pípnutia pre let na padáku (Pokojnejšie vzory)
+            // ===============================================
+
+            // 300m - Dve krátke pípnutia
+            if (filteredAltitude <= currentSettings.canopyAltitudes[0] && !p_300m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Let na padáku (300m).\n", currentSettings.canopyAltitudes[0]);
+                int pattern[] = {100, 100}; // Dve krátke pípnutia
+                playPattern(pattern, 2, beepFrequency, 50, 1, 0, currentVolume); // Opakovať 1x, krátka pauza
+                p_300m_triggered = true;
+            } else if (filteredAltitude > currentSettings.canopyAltitudes[0] + 10 && p_300m_triggered) { // Hysterezia 10m
+                p_300m_triggered = false;
+            }
+
+            // 200m - Tri krátke pípnutia
+            if (filteredAltitude <= currentSettings.canopyAltitudes[1] && !p_200m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Let na padáku (200m).\n", currentSettings.canopyAltitudes[1]);
+                int pattern[] = {100, 100, 100}; // Tri krátke pípnutia
+                playPattern(pattern, 3, beepFrequency, 50, 1, 0, currentVolume); // Opakovať 1x, krátka pauza
+                p_200m_triggered = true;
+            } else if (filteredAltitude > currentSettings.canopyAltitudes[1] + 10 && p_200m_triggered) { // Hysterezia 10m
+                p_200m_triggered = false;
+            }
+
+            // 100m - Štyri krátke pípnutia
+            if (filteredAltitude <= currentSettings.canopyAltitudes[2] && !p_100m_triggered) {
+                Serial.printf("INFO: Aktivujem pípnutie %.0fm – Let na padáku (100m).\n", currentSettings.canopyAltitudes[2]);
+                int pattern[] = {100, 100, 100, 100}; // Štyri krátke pípnutia
+                playPattern(pattern, 4, beepFrequency, 50, 1, 0, currentVolume); // Opakovať 1x, krátka pauza
+                p_100m_triggered = true;
+            } else if (filteredAltitude > currentSettings.canopyAltitudes[2] + 10 && p_100m_triggered) { // Hysterezia 10m
+                p_100m_triggered = false;
+            }
+        } // Koniec if (altimeterArmed)
+
+
+        // Odosielanie dát cez BLE
+        if (deviceConnected && pDataCharacteristic != NULL) {
+            // ODOSIELAME 3 FLOAT HODNOTY (Výška, Teplota, Vertikálna Rýchlosť)
+            uint8_t payload[12]; // 3 * 4 = 12 bytov
+
+            // 1. Filtrovaná Výška AGL (float)
+            memcpy(payload, &filteredAltitude, sizeof(float));
+            // 2. Teplota (float)
+            memcpy(payload + sizeof(float), &currentTemperature_C, sizeof(float));
+            // 3. Vertikálna Rýchlosť (float)
+            memcpy(payload + 2 * sizeof(float), &verticalVelocity, sizeof(float));
+
+            pDataCharacteristic->setValue(payload, sizeof(payload));
+            pDataCharacteristic->notify();
+        }
+
+        Serial.printf("Altimeter Task: Tlak=%.2f hPa, Teplota=%.2f C, Surová Výška=%.2f m, Filtrovaná Výška=%.2f m AGL, Vertikálna Rýchlosť=%.2f m/s, Armed=%s, ManualOverride=%s\n",
+                        currentPressure_hPa, currentTemperature_C, currentAltitude_m, filteredAltitude, verticalVelocity, altimeterArmed ? "True" : "False", manualArmOverride ? "True" : "False");
+        vTaskDelay(pdMS_TO_TICKS(50)); // Oneskorenie pre ďalšie odčítanie senzora a BLE prenos (20 Hz frekvencia)
+    }
+}
+
+// Úloha pre monitorovanie batérie a obsluhu BLE nastavení
+void batteryMonitorTask(void *pvParameters) {
+    Serial.println("Battery Monitor Task: Spustená na Core0, čaká na BLE pripojenie.");
+    vTaskSuspend(NULL); // Pozastaví sám seba
+
+    for (;;) {
+        if (deviceConnected) {
+            // TODO: Implementácia monitorovania batérie
+            // Napr. čítanie ADC pinu pripojeného k deliču napätia batérie
+            // int batteryVoltageRaw = analogRead(BATTERY_ADC_PIN);
+            // float batteryVoltage = map(batteryVoltageRaw, 0, 4095, 0, 4200) / 1000.0; // Pre 0-4.2V batériu
+
+            // Serial.printf("Battery Monitor Task: Napätie batérie: %.2fV\n", batteryVoltage);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000)); // Kontroluj každú sekundu (ak je pripojené BLE)
+    }
+}
+
+// Nová úloha pre ukladanie (umiestnite pred setup())
+void saveTask(void *pvParameters) {
+    while(1) {
+        AppSettings settings;
+        if(xQueueReceive(settingsQueue, &settings, portMAX_DELAY) == pdTRUE) {
+            processSettings(&settings); // Funkcia z predchádzajúcej odpovede
+        }
+    }
+}
+void processSettings(AppSettings* settings) {
+    // A. Uloženie do NVS
+    preferences.begin("altimeter-cfg", false);
+    preferences.putBytes("settings", settings, sizeof(AppSettings));
+    preferences.end();
+
+    // B. Výpis (optimálny formát)
+    Serial.printf("Uložené:\nF:%.2f,%.2f,%.2f,%.2f|C:%.2f,%.2f,%.2f|F:%d,L:%d,A:%.2f\n",
+        settings->freefallAltitudes[0], settings->freefallAltitudes[1],
+        settings->freefallAltitudes[2], settings->freefallAltitudes[3],
+        settings->canopyAltitudes[0], settings->canopyAltitudes[1],
+        settings->canopyAltitudes[2],
+        settings->activeFilter, settings->enableDataLogging,
+        settings->armingAltitude);
+
+    // C. BLE Notifikácie
+    if (deviceConnected && xSemaphoreTake(configMutex, pdMS_TO_TICKS(50))) {
+        notifyBLE(settings);
+        xSemaphoreGive(configMutex);
+    }
+}
+
+// =====================================================================================================================
+// 9.0. Nastavenie (Setup) a Slučka (Loop)
+// =====================================================================================================================
+void setup() {
+    // 1. Inicializácia fronty a sériovej komunikácie
+    settingsQueue = xQueueCreate(3, sizeof(AppSettings));
+    Serial.begin(115200);
+    delay(1000); // Stabilizačný čas pre sériový port
+    Serial.flush();
+
+    // 2. Informačné výpisy
+    Serial.printf("Spúšťam firmvér ESP32 verzia: %s\n", FIRMWARE_VERSION);
+    Serial.printf("CPU frekvencia: %d MHz\n", getCpuFrequencyMhz());
+
+    // 3. Mutex a nastavenia
+    configMutex = xSemaphoreCreateMutex();
+    if (!configMutex) {
+        Serial.println("CHYBA: Mutex sa nepodaril vytvoriť!");
+        while(1); // Zastaviť pri chybe
+    }
+    loadSettings(); // Načítanie nastavení z NVS
+
+    // 4. BLE inicializácia
+    BLEDevice::init("LilyGO_Altimeter");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+
+    // 5. BLE služba a charakteristiky
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    
+    // Dátová charakteristika
+    pDataCharacteristic = pService->createCharacteristic(
+        DATA_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pDataCharacteristic->addDescriptor(new BLE2902());
+
+    // Príkazová charakteristika
+    pCommandCharacteristic = pService->createCharacteristic(
+        COMMAND_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE
+    );
+    pCommandCharacteristic->setCallbacks(new MyCommandCharacteristicCallbacks());
+
+    // Freefall charakteristika
+    pFreefallAltsCharacteristic = pService->createCharacteristic(
+        FREEFALL_ALTS_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pFreefallAltsCharacteristic->setCallbacks(new FreefallAltsCharacteristicCallbacks());
+    pFreefallAltsCharacteristic->addDescriptor(new BLE2902());
+
+    // Canopy charakteristika
+    pCanopyAltsCharacteristic = pService->createCharacteristic(
+        CANOPY_ALTS_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pCanopyAltsCharacteristic->setCallbacks(new CanopyAltsCharacteristicCallbacks());
+    pCanopyAltsCharacteristic->addDescriptor(new BLE2902());
+
+    // Ostatné nastavenia
+    pOtherSettingsCharacteristic = pService->createCharacteristic(
+        OTHER_SETTINGS_CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY
+    );
+    pOtherSettingsCharacteristic->setCallbacks(new OtherSettingsCharacteristicCallbacks());
+    pOtherSettingsCharacteristic->addDescriptor(new BLE2902());
+
+    pService->start();
+
+    // 6. BLE advertising
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->setMinPreferred(0x12);
+    BLEDevice::startAdvertising();
+    Serial.println("BLE pripravené");
+
+    // 7. Vytvorenie úloh
+    xTaskCreatePinnedToCore(
+        altimeterTask,
+        "Altimeter Task",
+        10000,
+        NULL,
+        5, // Vyššia priorita
+        &AltimeterTaskHandle,
+        1 // Core 1
+    );
+
+    xTaskCreatePinnedToCore(
+        saveTask, // Nová úloha pre ukladanie
+        "Save Task",
+        4096,
+        NULL,
+        3, // Stredná priorita
+        NULL,
+        0 // Core 0
+    );
+
+    xTaskCreatePinnedToCore(
+        batteryMonitorTask,
+        "Battery Monitor",
+        5000,
+        NULL,
+        2, // Nižšia priorita
+        &BatteryMonitorTaskHandle,
+        0 // Core 0
+    );
+    // 8. Inicializácia pípáka
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW); // Uisti sa, že je bzučiak pri štarte vypnutý
+
+    // Test pípáka pri štarte s frekvenciou 3000 Hz a volumeLevel 5
+    beep(3000, 100, 5); // Krátky tón 3kHz na 100ms so strednou hlasitosťou
+    Serial.println("Krátky tón 3kHz  1111");
+    delay(50);          // Krátka pauza
+    beep(3000, 100, 5); // Krátky tón 3kHz na 100ms so strednou hlasitosťou
+    Serial.println("Krátky tón 3kHz 2222");
+}
+
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
